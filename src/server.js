@@ -90,6 +90,18 @@ app.post('/api/proposals/:id/rebase-confirm', requireRole('recordist'), wrap((re
   res.status(201).json({ ok: true, id });
 }));
 
+// ---------- 恢复到历史版本（复核员）：先预览逐段净变化，再在空暂存时确认采纳为恢复提议 ----------
+// 恢复提议关联目标版本，确认后仍走现有发布前异议逐条回应门槛，发布为新的不可变版本。
+app.post('/api/restore/:targetVersion/preview', requireRole('reviewer'), wrap((req, res) => {
+  const { reason } = req.body || {};
+  res.json(store.restorePreview(db, req.user, parseInt(req.params.targetVersion, 10), reason));
+}));
+
+app.post('/api/restore/confirm', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.restoreConfirm(db, req.user, req.body || {});
+  res.status(201).json(result);
+}));
+
 // ---------- 发布（复核员） ----------
 app.post('/api/publish', requireRole('reviewer'), wrap((req, res) => {
   const { note } = req.body || {};

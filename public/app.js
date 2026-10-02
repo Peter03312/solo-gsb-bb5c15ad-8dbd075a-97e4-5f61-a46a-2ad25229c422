@@ -208,7 +208,7 @@ const STATUS_LABEL = {
   pending: '待复核', adopted: '已采纳·暂存', rejected: '已驳回',
   conflicted: '冲突', published: '已发布', active: '有效', needs_relocation: '待重新定位',
 };
-const DECISION_LABEL = { adopt: '采纳', reject: '驳回', conflict: '标记冲突', publish: '发布', rebase: '续提' };
+const DECISION_LABEL = { adopt: '采纳', reject: '驳回', conflict: '标记冲突', publish: '发布', rebase: '续提', restore: '恢复提议' };
 
 // 记录员可对本人“基版已过期”类冲突提议发起续提（换算到当前版本重新提交）
 function canRebase(p) {
@@ -706,7 +706,8 @@ function openProposalModal(id) {
       第 ${p.seg} 段 · 范围 [${p.start_cp}, ${p.end_cp}) · 基版 v${p.base_ver}
       ${p.published_version_id ? `· 已随 v${p.published_version_id} 发布` : ''}
       ${p.rebased_from_id ? `· 续提自冲突提议 #${p.rebased_from_id}` : ''}
-      ${p.continued_by_id ? `· 已续提为提议 #${p.continued_by_id}` : ''}<br/>
+      ${p.continued_by_id ? `· 已续提为提议 #${p.continued_by_id}` : ''}
+      ${p.restore_target_version_id ? `· <span class="restore-link">↺ 恢复提议（关联目标版本 v${p.restore_target_version_id}）</span>` : ''}<br/>
       提交人：${esc(p.creator_name)}（${esc(p.creator_user)}）· ${p.created_at} UTC
     </div>
     <div class="quote">${esc(p.original_excerpt)}</div>
@@ -939,6 +940,7 @@ function renderProposals() {
         <span class="card-meta">v${p.base_ver} · ${p.created_at.slice(5, 16)}</span>
       </div>
       <div class="card-meta">第 ${p.seg} 段 [${p.start_cp},${p.end_cp}) · ${esc(p.creator_name)}</div>
+      ${p.restore_target_version_id ? `<div class="card-meta restore-link">↺ 恢复提议：关联目标版本 <a href="#" data-ver-view="${p.restore_target_version_id}">v${p.restore_target_version_id}</a></div>` : ''}
       ${p.rebased_from_id ? `<div class="card-meta">↳ 续提自冲突提议 #${p.rebased_from_id}</div>` : ''}
       ${p.continued_by_id ? `<div class="card-meta">↳ 已续提为提议 #${p.continued_by_id}</div>` : ''}
       <div class="quote">${esc(p.original_excerpt)}</div>
@@ -965,6 +967,9 @@ function renderProposals() {
 
   $$('#panel-proposals [data-rebase]').forEach((b) =>
     b.addEventListener('click', () => openRebase(parseInt(b.dataset.rebase, 10))));
+
+  $$('#panel-proposals [data-ver-view]').forEach((a) =>
+    a.addEventListener('click', (e) => { e.preventDefault(); openVersion(parseInt(a.dataset.verView, 10)); }));
 
   $$('#panel-proposals [data-adopt]').forEach((b) => b.addEventListener('click', async () => {
     const id = parseInt(b.dataset.adopt, 10);
@@ -1118,7 +1123,11 @@ function renderVersions() {
         <div class="vid">v${v.id} ${v.id === booth.currentVersion.id ? '<span class="tag tag-published">当前</span>' : ''}</div>
         <div class="card-meta">${esc(v.note) || '<span class="muted">版本备注仅工作人员可见</span>'} · ${esc(v.creator_name || '系统')} · ${v.created_at} UTC</div>
       </div>
-      <button class="btn small" data-ver="${v.id}">只读查看</button>
+      <div class="ver-card-actions">
+        ${me.role === 'reviewer' && v.id !== booth.currentVersion.id
+          ? `<button class="btn small primary" data-restore="${v.id}">恢复到此版本…</button>` : ''}
+        <button class="btn small" data-ver="${v.id}">只读查看</button>
+      </div>
     </div>`).join('')}`;
   const fromSel = $('#diff-from');
   const toSel = $('#diff-to');
@@ -1140,6 +1149,115 @@ function renderVersions() {
   });
   $$('#panel-versions [data-ver]').forEach((b) =>
     b.addEventListener('click', () => openVersion(parseInt(b.dataset.ver, 10))));
+  $$('#panel-versions [data-restore]').forEach((b) =>
+    b.addEventListener('click', () => openRestoreForm(parseInt(b.dataset.restore, 10))));
+}
+
+// ---------- 恢复到历史版本（复核员）：先填理由预览逐段净变化，确认后采纳为恢复提议 ----------
+function openRestoreForm(targetVersionId) {
+  openModal(`
+    <h3>恢复当前正文到 v${targetVersionId}</h3>
+    <p class="muted">先预览把当前正文恢复到目标版本的<b>逐段净变化</b>。系统沿现有修订链按码点身份计算，
+      只对净变化范围生成恢复提议，重复文字不靠同文搜索定位，未变化范围不会被触及。
+      确认时仅在<b>暂存区为空</b>时采纳恢复提议；之后仍须按现有异议逐条回应门槛发布为新的不可变版本，
+      旧版、决议与原文快照均不改写。</p>
+    <label>恢复理由 <em style="color:var(--danger)">*</em>
+      <textarea id="rs-reason" rows="3" placeholder="如：经核对录音，v${targetVersionId} 的表述才准确，后续两次修订系误改，恢复该版正文"></textarea>
+    </label>
+    <p class="error-text" id="rs-msg"></p>
+    <div class="actions">
+      <button class="btn" data-close>取消</button>
+      <button class="btn primary" id="rs-preview">预览逐段净变化</button>
+    </div>`);
+  $('#rs-preview').addEventListener('click', async () => {
+    const reason = $('#rs-reason').value;
+    if (!reason.trim()) { $('#rs-msg').textContent = '恢复理由不能为空。'; return; }
+    try {
+      const data = await api(`/api/restore/${targetVersionId}/preview`, { method: 'POST', body: { reason } });
+      showRestorePreview(data);
+    } catch (err) { $('#rs-msg').textContent = err.message; }
+  });
+}
+
+const RESTORE_KIND_LABEL = { insert: '插入', delete: '删除', replace: '替换' };
+
+function showRestorePreview(d) {
+  const rows = d.segments.map((s) => {
+    const trows = s.changes.map((h) => {
+      const contribs = (h.contributors || []).length
+        ? h.contributors.map((c) => `<span class="tag tag-adopted">提议 #${c.proposalId} · 随 v${c.versionId} 发布</span>`).join(' ')
+        : '<span class="muted">（无）</span>';
+      return `
+        <tr>
+          <td class="src-range">[${h.now.start}, ${h.now.end})</td>
+          <td class="diff-cell diff-old">${esc(h.now.text) || '<span class="muted">（空）</span>'}</td>
+          <td class="src-range">[${h.old.start}, ${h.old.end})</td>
+          <td class="diff-cell diff-new">${esc(h.old.text) || '<span class="muted">（空）</span>'}</td>
+          <td><span class="tag tag-needs_relocation">${RESTORE_KIND_LABEL[h.restoreKind] || h.restoreKind}</span>
+            <div class="diff-contrib">${contribs}</div></td>
+        </tr>`;
+    }).join('');
+    // 高亮：当前版标出将被删改的区间（红），目标版标出恢复后落点（绿）
+    const currentRanges = s.changes.map((h) => h.now);
+    const targetRanges = s.changes.map((h) => h.old);
+    return `
+      <div class="diff-seg changed" data-seg="${s.seg}">
+        <div class="diff-seg-head">
+          <span class="seg-no">${s.seg}</span>
+          <span class="tag tag-adopted">${s.changeCount} 处净变化</span>
+        </div>
+        <div class="diff-pair" data-pair="${s.seg}">
+          <div class="diff-col">
+            <div class="diff-col-head">当前 v${d.currentVersion.id}（${s.currentLength} 码点）· 将删改</div>
+            <div class="diff-text">${diffHighlightedHtml(s.currentText, currentRanges, 'mk-del')}</div>
+          </div>
+          <div class="diff-col">
+            <div class="diff-col-head">目标 v${d.targetVersion.id}（${s.targetLength} 码点）· 恢复后</div>
+            <div class="diff-text">${diffHighlightedHtml(s.targetText, targetRanges, 'mk-ins')}</div>
+          </div>
+        </div>
+        <table class="src-table diff-table">
+          <thead><tr><th>当前区间</th><th>当前文字</th><th>目标区间</th><th>恢复为</th><th>恢复动作与促成提议</th></tr></thead>
+          <tbody>${trows}</tbody>
+        </table>
+      </div>`;
+  }).join('');
+
+  openModal(`
+      <div class="v-head">
+        <h3>恢复预览：v${d.currentVersion.id} → v${d.targetVersion.id}</h3>
+        <button class="btn small" data-close>关闭</button>
+      </div>
+      <p class="muted">共 <b>${d.changedSegments}</b> 个变化段、<b>${d.changeCount}</b> 处净变化；
+        恢复将只覆盖这些范围（未变化段与未变化范围不产生提议、不触及异议）。
+        恢复理由：${esc(d.reason)}</p>
+      <div id="rs-stage-note" class="${d.stageEmpty ? 'gate-ok' : 'gate-warn'}">
+        ${d.stageEmpty
+          ? '✔ 当前暂存区为空，可以确认。'
+          : `⚠ 当前暂存区有 ${d.stageCount} 项已采纳修订：仅空暂存可确认恢复，请先关闭本预览，发布或驳回暂存修订后重新预览。`}
+      </div>
+      <div class="diff-summary">${rows}</div>
+      <p class="error-text" id="rs-confirm-msg"></p>
+      <div class="actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn primary" id="rs-confirm" ${d.stageEmpty ? '' : 'disabled'}>
+          ${d.stageEmpty ? `确认恢复：采纳 ${d.changeCount} 项恢复提议到暂存区` : '暂存区非空，不能确认'}
+        </button>
+      </div>`, true);
+
+  $('#rs-confirm').addEventListener('click', async () => {
+    const btn = $('#rs-confirm');
+    btn.disabled = true;
+    try {
+      const r = await api('/api/restore/confirm', { method: 'POST', body: { token: d.token } });
+      closeModal();
+      await reload();
+      toast(`已采纳 ${r.proposalCount} 项恢复提议（关联 v${r.targetVersionId}，批次 ${r.batchId.slice(0, 8)}）；请在发布条逐条回应被触及异议后发布新版本`, 'success');
+    } catch (err) {
+      $('#rs-confirm-msg').textContent = err.message;
+      btn.disabled = false;
+    }
+  });
 }
 
 // ---------- 跨版净变化对照弹窗（按段并排展示旧版/新版正文，标出净变化与促成提议） ----------
@@ -1373,13 +1491,25 @@ function renderPublishBar() {
   }
   bar.classList.remove('hidden');
   const segDesc = {};
+  let restoreCount = 0;
+  const restoreTargets = new Set();
   for (const p of booth.stage) {
     segDesc[p.seg] = (segDesc[p.seg] || 0) + 1;
+  }
+  for (const p of booth.proposals) {
+    if (p.status === 'adopted' && p.base_ver === booth.currentVersion.id && p.restore_target_version_id) {
+      restoreCount++;
+      restoreTargets.add(p.restore_target_version_id);
+    }
   }
   $('#stage-summary').innerHTML =
     `暂存区：<b>${booth.stage.length}</b> 项已采纳修订（` +
     Object.entries(segDesc).map(([s, n]) => `第${s}段×${n}`).join('、') +
-    `）。互不重叠的修订将合并发布为 v${booth.currentVersion.id + 1}`;
+    `）。互不重叠的修订将合并发布为 v${booth.currentVersion.id + 1}` +
+    (restoreCount
+      ? `<div class="restore-stage-note">↺ 其中 ${restoreCount} 项为恢复提议（目标版本 ${[...restoreTargets].map((t) => `v${t}`).join('、')}）：` +
+        `确认恢复只覆盖净变化范围；发布后正文回到目标版本，旧版与决议不改写。</div>`
+      : '');
 
   // 发布前回应门槛
   const items = gateItems();

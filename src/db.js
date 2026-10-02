@@ -78,6 +78,9 @@ function initSchema(db) {
     conflict_reason TEXT NOT NULL DEFAULT '',
     conflict_kind TEXT NOT NULL DEFAULT '',  -- 冲突类别：base_expired（基版已过期）| overlap（范围交叠）
     rebased_from_id INTEGER REFERENCES proposals(id), -- 续提来源：本提议由哪个冲突提议换算重提而来
+    -- 恢复提议：非空表示本提议由“把当前正文恢复到该历史版本”生成（关联目标版本）；
+    -- 恢复提议在确认事务内直接采纳，仍经现有异议回应门槛随新不可变版本发布。
+    restore_target_version_id INTEGER REFERENCES versions(id),
     created_by  INTEGER NOT NULL REFERENCES users(id),
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     decided_by  INTEGER REFERENCES users(id),
@@ -226,6 +229,9 @@ function initSchema(db) {
   }
   if (!pcols.includes('rebased_from_id')) {
     db.exec(`ALTER TABLE proposals ADD COLUMN rebased_from_id INTEGER REFERENCES proposals(id)`);
+  }
+  if (!pcols.includes('restore_target_version_id')) {
+    db.exec(`ALTER TABLE proposals ADD COLUMN restore_target_version_id INTEGER REFERENCES versions(id)`);
   }
 }
 

@@ -473,6 +473,7 @@ body {
 .decision-item.t-adopt { border-color: var(--adopt-border); }
 .decision-item.t-reject { border-color: #b9b5a6; }
 .decision-item.t-conflict { border-color: var(--conflict-border); }
+.decision-item.t-restore { border-color: var(--adopt-border); background: var(--adopt-bg); }
 .ver-card {
   display: flex;
   justify-content: space-between;
@@ -484,6 +485,10 @@ body {
   background: #fffdf8;
 }
 .ver-card .vid { font-weight: 700; }
+.ver-card-actions { display: flex; gap: 8px; align-items: center; }
+.restore-link { color: var(--primary-dark); font-weight: 600; }
+.restore-link a { color: var(--primary-dark); text-decoration: underline; }
+.restore-stage-note { margin-top: 6px; color: var(--primary-dark); font-size: 13px; }
 
 /* ---------- Toast ---------- */
 .toast {

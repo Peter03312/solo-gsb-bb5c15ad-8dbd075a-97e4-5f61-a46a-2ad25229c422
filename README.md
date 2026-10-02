@@ -19,6 +19,15 @@
 解除保密后可重查；工作人员按现有权限查看。未导入、版本不存在或顺序不合法均明确拒绝；
 查询只读，不改写版本、决议或保密状态。
 
+**复核员可把当前正文恢复到任一更早的已发布历史版本**：先选择目标版本并填写**非空理由**预览
+“当前正文 → 目标版”的**逐段净变化**（与跨版对照同一码点身份链口径，重复文字不靠同文搜索定位）；
+确认时只接受**预览所见的当前版本与暂存状态**，且**仅空暂存可确认**。服务端按净变化逐段生成
+**只覆盖净变化范围、关联目标版本的恢复提议**并立即采纳（未变化范围不产生提议，发布时不会被误算
+为触及异议）；恢复提议仍须通过**现有发布前异议逐条回应门槛**才发布为**新的不可变版本**，
+旧版、决议与原文快照一律不改写，正文来源、异议锚点、段关注通知均沿用正常发布规则。
+预览后版本或暂存一旦变化，整次确认拒绝且**不留下任何部分提议**；无文档、目标版不存在、
+目标就是当前版、两版正文相同或理由为空均明确拒绝。
+
 
 **记录员可为本人“待复核”的修订提议上传依据文件**：提交原始文件名与预期 SHA-256，服务端只按内容
 接收可识别的 PDF、PNG、JPEG、MP3、WAV（单件 ≤ 20 MB），并比对实际摘要；待复核期间可删除误传附件，
@@ -72,7 +81,7 @@ SQLite 数据库保存在命名卷 `hearing-revision-data`（容器内 `/data/he
 | 角色 | 用户名 | 密码 | 可执行操作 |
 | --- | --- | --- | --- |
 | 记录员 | `recorder` | `recorder123` | 导入逐字稿、提交修订提议、只读查看发布核对 |
-| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布前回应被触及异议、发布新版本、重新定位异议、**按段号保密/解除保密** |
+| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布前回应被触及异议、发布新版本、重新定位异议、**恢复到历史版本**、**按段号保密/解除保密** |
 | 参与者 | `participant` | `participant123` | 对原文范围提出异议、重新定位自己的异议（保密段除外）；保密段只看到占位 |
 
 种子账户仅在数据库用户表为空时创建；可通过环境变量覆盖用户名与密码（见下文配置）。
@@ -241,6 +250,36 @@ npm test
     - 失败均明确拒绝：未导入（无文档）→ 409；段号非整数 → 400；未知段号 → 404；未登录 → 401；
       把**他人通知**标为已读 → 403；通知不存在（含对参与者隐藏的保密段通知）→ 404。
       通知只在发布数据库事务内生成，**发布失败（如发布前异议回应未结清）整体回滚，不留通知、不产生版本**。
+11. **恢复到历史版本（本轮新增，复核员）**：在右侧“版本”面板任一**非当前**版本卡片点击
+    **“恢复到此版本…”**，填写**非空恢复理由**后先发起**恢复预览**；或调用
+    `POST /api/restore/:targetVersion/preview`。
+    - **预览口径**：弹窗按段并排展示**当前版（将删改，红）与目标版（恢复后，绿）**正文，
+      表格逐处列出当前区间/文字、目标区间/文字、**恢复动作（插入/删除/替换）与促成该段差异的
+      跨版已发布提议**；只列出有净变化的段，给出变化段数与净变化总处数，并显示当前暂存是否为空。
+      净变化与跨版对照完全同口径：沿修订链逐码点身份对齐，**重复文字绝不靠同文搜索配对**，
+      中途改动最终撤销、两端相同的整块不计。预览是只读操作，不改写任何状态。
+    - **确认口径**：点“确认恢复”（或调用 `POST /api/restore/confirm` 回传预览 `token`）后，
+      服务端在同一事务内重新核对：**当前版本与预览一致、暂存区为空且指纹一致、理由与净变化摘要
+      未被篡改**；随后按每处净变化在**当前版坐标**生成一条**恢复提议**（`[now.start,now.end)`
+      替换为目标版文字；纯删除/纯插入对应零长度区间），其依据为“恢复到 vN：<理由>”，
+      **关联目标版本**（`restore_target_version_id`）并**直接采纳**进入发布暂存区。
+      同段多条恢复提议在当前版坐标严格互不重叠；未变化范围不产生提议。事务末尾还有合版自检：
+      应用全部恢复编辑后的正文必须与目标版快照逐码点一致，否则整批回滚。
+    - **发布仍走现有门槛**：恢复提议只是“已采纳提议”，发布前被其触及的异议仍须复核员
+      **逐条非空回应**（未变化范围上的异议不会被触及——触及判定只看恢复编辑的码点区间）；
+      发布形成**新的不可变版本**（版本号继续递增，不覆盖任何旧版）。发布时其余待复核提议照常
+      标记基版过期、异议锚点照常映射、段关注净变化通知照常生成；恢复回的文字在“来源”中归属
+      **恢复提议与新版本**（不归初始导入），跨版对照仍保留中途各版的真实改动历史。
+      **旧版本、历史决议与异议原文快照从不改写**；恢复动作在决议流留痕（`restore` 类型，
+      记录批次、目标版本、段与区间），历史版本只读视图与提议卡片展示“↺ 恢复提议（关联 vN）”。
+    - **失败均明确拒绝且不留部分提议**：无文档 → 409 `NO_DOCUMENT`；目标版号非整数 → 400；
+      目标版不存在 → 404 `NOT_FOUND`；目标就是当前版 → 409 `RESTORE_SAME_VERSION`；
+      两版正文逐码点相同 → 409 `RESTORE_NO_NET_CHANGES`；理由为空 → 400；
+      非复核员（记录员/参与者/未登录）→ 403/401；**确认时暂存区非空** → 409 `STAGE_NOT_EMPTY`；
+      预览后已发布新版本/暂存变化/令牌被篡改 → 409 `STALE_PREVIEW`/`STALE_STAGE`；
+      缺少令牌 → 400。任一失败整事务回滚，暂存区与提议集合恢复到确认前状态。
+    - 网页在版本卡片提供入口、弹窗呈现恢复预览与关联信息，发布条显示“恢复提议（目标版本 vN）”
+      与待回应异议状态，提议卡片/详情显示关联目标版本（可点开只读查看该版）。
 
 所有失败场景（无权操作、非法字符范围、重复发布、重复导入、重复采纳/重定位等）均返回明确的
 HTTP 状态码与中文原因，且在数据库事务中执行——失败即回滚，不改变任何状态。
@@ -267,6 +306,8 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | `POST /api/proposals/:id/reject` | 复核员 | 驳回（可含 `reason`） |
 | `POST /api/proposals/:id/rebase-preview` | 记录员（本人） | 续提预览：把“基版已过期”冲突提议的选区逐版换算到当前正文，返回目标选区/摘录/原替换文字与依据及确认凭证 |
 | `POST /api/proposals/:id/rebase-confirm` | 记录员（本人） | 确认续提 `{token}`：校验凭证（版本与暂存区未变、选区未被触及、不与暂存区交叠）后生成关联原提议的新待复核提议 |
+| `POST /api/restore/:targetVersion/preview` | 复核员 | **恢复预览**：`{reason}` 非空；按修订链码点身份逐段返回当前版→目标版的净变化（当前/目标半开区间与文字、恢复动作、促成提议）与确认凭证。无文档 409、目标版不存在 404、目标即当前 409、两版正文相同 409、理由空 400；只读不改写状态 |
+| `POST /api/restore/confirm` | 复核员 | **确认恢复** `{token}`：仅空暂存可确认；校验预览所见版本/暂存/理由/净变化摘要后，按净变化生成**关联目标版本**的恢复提议并直接采纳（整批事务，失败不留部分提议）。随后仍经异议逐条回应门槛发布为新不可变版本；暂存非空 409 `STAGE_NOT_EMPTY`、预览后版本/暂存变化或令牌篡改 409、缺令牌 400 |
 | `POST /api/publish` | 复核员 | 合并暂存修订并发布新版本 |
 | `POST /api/objections` | 登录用户 | 对原文范围提出异议 `{seg,start,end,note}` |
 | `POST /api/objections/:id/relocate` | 提出者或复核员 | 对“待重新定位”的异议手动重定位 |
@@ -474,6 +515,84 @@ curl -s -b /tmp/rec.cookie "http://localhost:3000/api/diff"            # 未导�
 > 并查集沿“每次修订删除的身份 ∪ 插入的身份”归并，取变化端点身份关联到的、区间 `(from,to]` 内的全部
 > 已发布提议；服务端另校验重放结果与两端不可变快照逐码点一致，不一致（数据损坏）时报错而非编造。
 
+### 恢复到历史版本调用示例（curl）
+
+```bash
+# 1) 复核员登录
+curl -i -c /tmp/rev.cookie -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"reviewer","password":"reviewer123"}'
+
+# 2) 预览“当前 v5 恢复到 v1”的逐段净变化（理由必填；只读，不改写状态）
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/restore/1/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"经核对录音，v3/v4 的日期与姓名修订均系误改，恢复初始表述"}'
+# {
+#   "currentVersion": { "id": 5, "note": "…", "createdAt": "…" },
+#   "targetVersion":  { "id": 1, "note": "初始导入", "createdAt": "…" },
+#   "reason": "经核对录音……",
+#   "changedSegments": 1, "changeCount": 2,
+#   "stageEmpty": true, "stageCount": 0,
+#   "segments": [
+#     { "seg": 1,
+#       "currentText": "申请人张三丰称：我于2024年3月上旬收到通知。", "currentLength": 28,
+#       "targetText":  "申请人张三称：我于2024年3月1日收到通知。",   "targetLength": 27,
+#       "changeCount": 2,
+#       "changes": [
+#         { "kind": "replace", "restoreKind": "replace",
+#           "old": { "start": 3, "end": 5, "text": "张三" },
+#           "now": { "start": 3, "end": 6, "text": "张三丰" },
+#           "contributors": [ { "proposalId": 2, "versionId": 3 } ] },
+#         { "kind": "replace", "restoreKind": "replace",
+#           "old": { "start": 15, "end": 19, "text": "3月1日" },
+#           "now": { "start": 16, "end": 20, "text": "3月上旬" },
+#           "contributors": [ { "proposalId": 1, "versionId": 2 },
+#                             { "proposalId": 3, "versionId": 4 } ] } ] } ],
+#   "token": { "v": 5, "t": 1, "stg": "[]", "reason": "经核对录音……", "digest": "…(sha256)" } }
+#
+# - restoreKind：恢复要执行的动作（insert 插入 / delete 删除 / replace 替换）；
+# - old/now：目标版/当前版该段的 Unicode 码点半开区间与文字（纯插入/删除为零长度区间）；
+# - contributors：促成该段差异的跨版已发布提议（仅信息展示，恢复提议本身只关联目标版本）。
+
+# 3) 确认恢复：回传预览 token（仅空暂存可确认；整批事务，失败不留部分提议）
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/restore/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"token":{"v":5,"t":1,"stg":"[]","reason":"经核对录音……","digest":"…"}}'
+# 201 {
+#   "ok": true, "batchId": "9f1e…",
+#   "currentVersionId": 5, "targetVersionId": 1, "reason": "经核对录音……",
+#   "changedSegments": 1, "changeCount": 2,
+#   "proposalCount": 2, "proposalIds": [8, 9],
+#   "proposals": [ {"id":8,"seg":1,"start":16,"end":20,"replacement":"3月1日"},
+#                  {"id":9,"seg":1,"start":3,"end":6,"replacement":"张三"} ] }
+# 提议 #8/#9 已采纳进入暂存区，依据为“恢复到 v1：经核对录音……”，关联目标版本 v1。
+
+# 4) 仍须按现有门槛回应被触及异议（未变化范围上的异议不在核对结果中），再发布
+curl -s -b /tmp/rev.cookie http://localhost:3000/api/publish-check
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/objections/2/respond \
+  -H 'Content-Type: application/json' -d '{"note":"恢复经核对原始录音，准予发布并留痕。"}'
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/publish \
+  -H 'Content-Type: application/json' -d '{"note":"恢复到 v1 的发布"}'
+# 201 {"ok":true,"versionId":6}   ← 新的不可变版本；v1~v5 快照与决议均不改写
+
+# 5) 失败场景：均明确拒绝，且不留下任何部分提议
+#    目标版不存在 404；目标就是当前版 409 RESTORE_SAME_VERSION；
+#    两版正文逐码点相同 409 RESTORE_NO_NET_CHANGES；理由为空 400；
+#    确认时暂存区非空 409 STAGE_NOT_EMPTY；
+#    预览后发布了新版本/暂存变化/token 被篡改 409 STALE_PREVIEW / STALE_STAGE；
+#    记录员、参与者调用 → 403 FORBIDDEN；未登录 → 401。
+```
+
+> 网页操作：在右侧“版本”面板的非当前版本卡片点“恢复到此版本…”，填写非空理由后预览，
+> 弹窗并排高亮当前/目标正文并逐处列出恢复动作与促成提议；暂存非空时确认按钮禁用。
+> 确认后发布条标注“恢复提议（目标版本 vN）”并按常规显示待回应异议；提议卡片带
+> “↺ 恢复提议：关联目标版本 vN”，历史版本决议中可查 `恢复提议` 留痕。
+
+> 恢复口径：净变化与 `GET /api/diff` 完全同源（`text.diffLineage`），方向取 target→current，
+> 再把每处净变化反译为当前版坐标上的恢复编辑 `[now.start,now.end) → old.text`，
+> 故“只覆盖净变化范围、重复文字不靠同文搜索、两端相同整块不计”由码点身份对齐天然保证；
+> 确认事务重算全部编辑并校验合版结果与目标版快照逐码点一致，不一致即整批回滚。
+
 ### 依据附件调用示例（curl）
 
 ```bash
@@ -595,8 +714,11 @@ curl -s -b /tmp/other.cookie -X POST http://localhost:3000/api/notifications/3/r
 - `proposals`：修订提议；记录段号、码点范围、替换文字、依据、**基版 `base_version_id`**、
   基版原文摘录、状态机（pending → adopted/rejected/conflicted → published）与冲突原因。
   `conflict_kind` 区分冲突类别（`base_expired` 基版已过期 / `overlap` 范围交叠，旧库打开时自动补列并按原因文本回填）；
-  `rebased_from_id` 记录续提来源——由哪个“基版已过期”冲突提议换算重提而来，双向可追溯。
-- `decisions`：决议审计流（adopt / reject / conflict / rebase / publish），不可变追加。
+  `rebased_from_id` 记录续提来源——由哪个“基版已过期”冲突提议换算重提而来，双向可追溯；
+  `restore_target_version_id` 记录**恢复提议**的目标历史版本（非空即为“把当前正文恢复到该版”
+  所生成；恢复提议在确认事务内直接以 `adopted` 落库，旧库打开时自动补列）。
+- `decisions`：决议审计流（adopt / reject / conflict / rebase / restore / publish），不可变追加。
+  `restore` 决议记录每一条恢复提议的批次 id（同一次确认共享 `batchId`）、当前版本与目标版本、段与区间。
 - `objections` + `objection_anchors`：异议主表（含永久原文快照）与逐版本锚点；
   发布时按修订映射，相交即置 `needs_relocation`。`objection_logs` 记录创建与重定位操作。
 - `objection_responses`：**发布前异议回应**。回应保存非空说明、触及该异议的暂存提议 id 快照
@@ -636,9 +758,9 @@ curl -s -b /tmp/other.cookie -X POST http://localhost:3000/api/notifications/3/r
 │   ├── server.js            # Express 路由与错误出口（含附件原始字节上传/下载）
 │   ├── auth.js              # Cookie 会话与角色鉴权
 │   ├── db.js                # SQLite 连接、建表、种子账户
-│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/正文来源/跨版净变化/附件权限/段关注通知
+│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/正文来源/跨版净变化/恢复到历史版本/附件权限/段关注通知
 │   ├── attachments.js       # 依据附件：内容类型嗅探、SHA-256、临时文件原子落盘
-│   └── text.js              # 码点偏移、范围校验、合版、引用映射、续提换算、来源重放、跨版净变化（身份链对齐）
+│   └── text.js              # 码点偏移、范围校验、合版、引用映射、续提换算、来源重放、跨版净变化（身份链对齐；恢复净变化同源）
 ├── public                   # 浏览器前端（原生 HTML/CSS/JS，无构建步骤）
 │   ├── index.html
 │   ├── styles.css
@@ -648,5 +770,6 @@ curl -s -b /tmp/other.cookie -X POST http://localhost:3000/api/notifications/3/r
     ├── e2e.test.js          # 临时库 + 真实 HTTP 的端到端测试
     ├── attachments.test.js  # 附件：校验/权限/冻结/删除/续提不继承/并发/无孤儿
     ├── attachments-restart.test.js # 附件：同一数据目录重启后的持久化与权限回归
-    └── follow-notifications.test.js # 段关注/通知：净变化才通知、幂等已读、他人通知 403、保密隐藏与恢复、失败发布不留通知
+    ├── follow-notifications.test.js # 段关注/通知：净变化才通知、幂等已读、他人通知 403、保密隐藏与恢复、失败发布不留通知
+    └── restore.test.js      # 恢复到历史版本：预览/确认拒绝场景、净变化逐段提议、重复文字不同文配对、未变化范围不触及异议、空暂存与整批回滚、经门槛发布不改写旧版、来源/通知回归
 ```

@@ -1,5 +1,6 @@
 'use strict';
 // 业务核心：导入、提议、采纳/驳回、冲突标记、发布合版、版本视图、异议引用、基版过期提议的续提
+const crypto = require('crypto');
 const { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance, diffLineage } = require('./text');
 const att = require('./attachments');
 
@@ -1502,6 +1503,296 @@ function diffView(db, fromId, toId, viewer) {
   };
 }
 
+// ---------- 恢复到历史版本（复核员：预览逐段净变化 → 确认采纳为恢复提议） ----------
+// 复核员可把“当前版本正文”恢复到任一更早的已发布版本：按现有修订链的码点身份逐段计算
+// 净变化（text.diffLineage，绝不靠同文搜索定位重复文字），只对净变化范围生成恢复提议；
+// 未变化范围不产生提议，发布时自然不会被误算为触及异议。恢复提议关联目标版本、
+// 在同一确认事务内直接采纳（仅空暂存可确认），仍经现有异议逐条回应门槛发布为新的不可变版本；
+// 旧版、决议与原文快照不改写。预览后版本或暂存变化则整次确认拒绝，不留下部分提议。
+
+// 按段收集从 v1 重放到 toVersion 所需的已发布修订步骤（与 diffView 相同口径）。
+function lineageEditIndex(db, toVersionId) {
+  const rows = db
+    .prepare(
+      `SELECT id, seg, start_cp, end_cp, replacement, published_version_id AS ver
+       FROM proposals
+       WHERE status='published' AND published_version_id >= 2 AND published_version_id <= ?
+       ORDER BY published_version_id, seg, start_cp, id`
+    )
+    .all(toVersionId);
+  const stepsByVerSeg = new Map();
+  for (const p of rows) {
+    const key = `${p.ver}:${p.seg}`;
+    if (!stepsByVerSeg.has(key)) stepsByVerSeg.set(key, []);
+    stepsByVerSeg.get(key).push({ id: p.id, start: p.start_cp, end: p.end_cp, replace: p.replacement });
+  }
+  return stepsByVerSeg;
+}
+
+function stepsForSeg(stepsByVerSeg, seg, toVersionId) {
+  const steps = [];
+  for (let ver = 2; ver <= toVersionId; ver++) {
+    const edits = stepsByVerSeg.get(`${ver}:${seg}`);
+    if (edits && edits.length) steps.push({ version: ver, edits });
+  }
+  return steps;
+}
+
+// 计算 targetVersion → curVersion 方向的逐段净变化（段坐标分属两版），
+// 并翻译成“要把当前正文改回目标版”所需的恢复编辑（坐标为当前版）。
+// 两版正文逐码点相同的段无净变化、不产生恢复提议。
+function computeRestorePlan(db, cur, targetVersion) {
+  const curSegments = segmentsOf(cur);
+  const targetSegments = segmentsOf(targetVersion);
+  const v1 = db.prepare('SELECT * FROM versions WHERE id=1').get();
+  const v1Segments = segmentsOf(v1);
+  const stepsByVerSeg = lineageEditIndex(db, cur.id);
+
+  const segments = [];
+  let changedSegments = 0;
+  let changeCount = 0;
+  for (const sCur of curSegments) {
+    const seg = sCur.seg;
+    const targetIdx = segIndex(targetSegments, seg);
+    const v1Idx = segIndex(v1Segments, seg);
+    // 段号跨版本不变（发布只改段内正文）；异常数据明确报错而非编造恢复方案
+    if (targetIdx === -1 || v1Idx === -1) {
+      throw Object.assign(
+        new Error(`恢复方案计算失败：第 ${seg} 段在 v1/v${targetVersion.id} 中缺失（段结构异常，拒绝编造结果）`),
+        { status: 500, code: 'RESTORE_INCONSISTENT' }
+      );
+    }
+    const targetText = targetSegments[targetIdx].text;
+    const currentText = sCur.text;
+    if (currentText === targetText) continue; // 两版正文相同的段：无净变化，不产生提议
+
+    // 方向 target → current：diffLineage 的 old=目标版、now=当前版。
+    // 恢复编辑则是其反向操作：在“当前版坐标”把 now 区间替换为 old 文字。
+    // 中途改动最终撤销、两端文字相同的整块已由 diffLineage 的净变化口径剔除，不会生成编辑。
+    const result = diffLineage(v1Segments[v1Idx].text, stepsForSeg(stepsByVerSeg, seg, cur.id), targetVersion.id, cur.id);
+    if (result.versions[targetVersion.id] !== targetText || result.versions[cur.id] !== currentText) {
+      throw Object.assign(
+        new Error(`恢复方案重放与第 ${seg} 段版本快照不一致，拒绝输出恢复预览（数据可能已损坏）`),
+        { status: 500, code: 'RESTORE_MISMATCH' }
+      );
+    }
+
+    const changes = result.hunks.map((h) => ({
+      kind: h.kind, // diff 方向（target→current）：insert/delete/replace
+      restoreKind: h.kind === 'insert' ? 'delete' : h.kind === 'delete' ? 'insert' : 'replace',
+      old: h.old, // 目标版该段半开区间与文字
+      now: h.now, // 当前版该段半开区间与文字
+      contributors: h.contributors,
+    }));
+    // 恢复编辑（当前版坐标）：[now.start, now.end) -> old.text。
+    // 净变化块在当前版坐标互不重叠（同段 LCS 对齐的非恒等运行严格相邻不相交），
+    // 零长度插入块与其他块只可能共点相接，按半开区间口径不重叠——故同段多条恢复提议不互相交叠。
+    const edits = result.hunks.map((h) => ({ start: h.now.start, end: h.now.end, replace: h.old.text }));
+
+    changedSegments++;
+    changeCount += changes.length;
+    segments.push({
+      seg,
+      currentText,
+      targetText,
+      currentLength: codeLength(currentText),
+      targetLength: codeLength(targetText),
+      changeCount: changes.length,
+      changes,
+      edits,
+    });
+  }
+  return { currentVersionId: cur.id, targetVersionId: targetVersion.id, changedSegments, changeCount, segments };
+}
+
+// 恢复方案的确定性摘要：确认时逐段重算并比对，防止预览后方案漂移（坐标随发布变化）。
+// 摘要同时覆盖理由，确认只接受预览所见的理由，篡改令牌中的理由即与摘要不符。
+function restorePlanDigest(plan, reason) {
+  const canon = JSON.stringify({
+    v: plan.currentVersionId,
+    t: plan.targetVersionId,
+    r: reason,
+    s: plan.segments.map((sg) => [sg.seg, sg.edits.map((e) => [e.start, e.end, e.replace])]),
+  });
+  return crypto.createHash('sha256').update(canon, 'utf8').digest('hex');
+}
+
+// 恢复预览（只读）：校验目标版本与理由，逐段返回当前→目标的净变化及确认凭证；
+// 仅复核员（路由层限制）。预览不写入任何状态；空暂存与否都可预览（确认才要求空暂存）。
+function restorePreview(db, actor, targetId, reasonRaw) {
+  if (!getDoc(db)) throw conflict('尚未导入逐字稿，无历史版本可恢复', 'NO_DOCUMENT');
+  if (!Number.isInteger(targetId)) throw badRequest('缺少有效的目标版本号：须提供整数 targetVersionId');
+  const reason = typeof reasonRaw === 'string' ? reasonRaw.trim() : '';
+  if (!reason) throw badRequest('恢复理由不能为空：请说明把正文恢复到目标版本的原因');
+  const cur = latestVersion(db);
+  const target = db.prepare('SELECT * FROM versions WHERE id=?').get(targetId);
+  if (!target) throw notFound(`目标版本 v${targetId} 不存在，无法恢复`);
+  if (target.id === cur.id) {
+    throw conflict(`目标版本 v${target.id} 就是当前版本，无需恢复`, 'RESTORE_SAME_VERSION');
+  }
+  const plan = computeRestorePlan(db, cur, target);
+  if (plan.changeCount === 0) {
+    throw conflict(
+      `当前版本 v${cur.id} 与目标版本 v${target.id} 的正文逐码点相同，没有可恢复的净变化`,
+      'RESTORE_NO_NET_CHANGES'
+    );
+  }
+  const stage = stageProposals(db, cur.id);
+  const token = {
+    v: cur.id,
+    t: target.id,
+    stg: stageFingerprint(stage),
+    reason,
+    digest: restorePlanDigest(plan, reason),
+  };
+  return {
+    currentVersion: { id: cur.id, note: cur.note, createdAt: cur.created_at },
+    targetVersion: { id: target.id, note: target.note, createdAt: target.created_at },
+    reason,
+    changedSegments: plan.changedSegments,
+    changeCount: plan.changeCount,
+    stageEmpty: stage.length === 0,
+    stageCount: stage.length,
+    segments: plan.segments.map(({ edits, ...rest }) => rest), // 预览不下发服务端内部编辑
+    token,
+  };
+}
+
+// 直接落库一条“已采纳”的恢复提议（不经待复核/采纳状态机；整批采纳由恢复确认事务决定）。
+function insertAdoptedRestoreProposal(db, actor, { seg, start, end, replacement, basis, excerpt, baseVersionId, targetVersionId }) {
+  const r = db.prepare(
+    `INSERT INTO proposals
+      (seg, start_cp, end_cp, replacement, basis, original_excerpt, base_version_id, status,
+       conflict_reason, conflict_kind, rebased_from_id, restore_target_version_id,
+       created_by, decided_by, decided_at)
+     VALUES (?,?,?,?,?,?,?, 'adopted', '', '', NULL, ?, ?, ?, datetime('now'))`
+  ).run(seg, start, end, replacement, basis, excerpt, baseVersionId, targetVersionId, actor.id, actor.id);
+  return r.lastInsertRowid;
+}
+
+// 确认恢复：提交预览所见的当前版本与暂存状态（token）；仅空暂存可确认。
+// 校验全部在同一事务内完成：任一不满足即整体回滚，绝不留下部分提议。
+// 确认后恢复提议已采纳进入暂存区，仍须复核员按现有异议回应门槛发布为新的不可变版本。
+function restoreConfirm(db, actor, body) {
+  if (!getDoc(db)) throw conflict('尚未导入逐字稿，无历史版本可恢复', 'NO_DOCUMENT');
+  const token = body && body.token;
+  if (!token || typeof token !== 'object') {
+    throw badRequest('缺少预览凭证：恢复确认前必须先发起预览，确认时需回传预览返回的 token');
+  }
+  const targetId = parseInt(token.t, 10);
+  const fromVersionId = parseInt(token.v, 10);
+  const reason = typeof token.reason === 'string' ? token.reason.trim() : '';
+  if (!Number.isInteger(targetId) || !Number.isInteger(fromVersionId) || !reason || typeof token.digest !== 'string') {
+    throw badRequest('预览凭证不完整，请重新预览');
+  }
+  const target = db.prepare('SELECT * FROM versions WHERE id=?').get(targetId);
+  if (!target) throw notFound(`目标版本 v${targetId} 不存在，无法恢复`);
+
+  return db.transaction(() => {
+    const cur = latestVersion(db);
+    if (cur.id !== fromVersionId) {
+      throw conflict(
+        `预览后已发布新版本（预览基于 v${fromVersionId}，当前为 v${cur.id}），恢复方案已失效；整次确认已拒绝，未生成任何恢复提议，请重新预览`,
+        'STALE_PREVIEW'
+      );
+    }
+    if (target.id === cur.id) {
+      throw conflict('目标版本就是当前版本，无需恢复', 'RESTORE_SAME_VERSION');
+    }
+    const stage = stageProposals(db, cur.id);
+    if (stage.length > 0) {
+      throw conflict(
+        `暂存区非空（当前有 ${stage.length} 项已采纳修订）：仅空暂存可确认恢复，请先发布或驳回暂存修订后重新预览`,
+        'STAGE_NOT_EMPTY'
+      );
+    }
+    if (token.stg !== stageFingerprint(stage)) {
+      // 空指纹不一致理论上不会发生（非空已被上一条拦截），保留为并发/篡改的明确拒绝
+      throw conflict('预览后暂存区已变化，恢复方案可能不再适用；整次确认已拒绝，请重新预览', 'STALE_STAGE');
+    }
+
+    // 全部重算：净变化与坐标沿修订链现场逐码点计算，绝不凭同文搜索猜测位置
+    const plan = computeRestorePlan(db, cur, target);
+    if (plan.changeCount === 0) {
+      throw conflict(
+        `当前版本 v${cur.id} 与目标版本 v${target.id} 的正文没有净变化，无可恢复内容`,
+        'RESTORE_NO_NET_CHANGES'
+      );
+    }
+    if (restorePlanDigest(plan, reason) !== token.digest) {
+      throw conflict(
+        '当前正文到目标版本的净变化与预览不一致（预览后状态已变化）；整次确认已拒绝，未生成任何恢复提议，请重新预览',
+        'STALE_PREVIEW'
+      );
+    }
+
+    const batchId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
+    const basis = `恢复到 v${target.id}：${reason}`;
+    const created = [];
+    for (const s of plan.segments) {
+      // 段内编辑按当前坐标降序落库，保证 id 次序与发布合版右起应用次序一致（同段编辑互不重叠）
+      const editsDesc = s.edits.slice().sort((a, b) => b.start - a.start);
+      for (const e of editsDesc) {
+        const excerpt = sliceCP(s.currentText, e.start, e.end);
+        const id = insertAdoptedRestoreProposal(db, actor, {
+          seg: s.seg,
+          start: e.start,
+          end: e.end,
+          replacement: e.replace,
+          basis,
+          excerpt,
+          baseVersionId: cur.id,
+          targetVersionId: target.id,
+        });
+        addDecision(db, {
+          type: 'restore',
+          proposalId: id,
+          versionId: cur.id,
+          actorId: actor.id,
+          reason: basis,
+          detail: {
+            batchId,
+            fromVersion: cur.id,
+            targetVersion: target.id,
+            seg: s.seg,
+            start: e.start,
+            end: e.end,
+          },
+        });
+        created.push({ id, seg: s.seg, start: e.start, end: e.end, replacement: e.replace });
+      }
+    }
+
+    // 合版自检：把全部恢复编辑应用到当前正文，必须逐码点等于目标版本快照；
+    // 不一致只可能是计算/数据异常——整批回滚，绝不发布与目标不符的“恢复”。
+    const preview = previewSegments(segmentsOf(cur), stageProposals(db, cur.id));
+    const targetSegments = segmentsOf(target);
+    for (const t of targetSegments) {
+      const idx = segIndex(preview, t.seg);
+      const got = idx === -1 ? null : preview[idx];
+      if (!got || got.text !== t.text) {
+        throw Object.assign(
+          new Error(`恢复合版自检失败：第 ${t.seg} 段恢复结果与目标版本 v${target.id} 不一致，整批恢复已回滚`),
+          { status: 500, code: 'RESTORE_APPLY_MISMATCH' }
+        );
+      }
+    }
+
+    return {
+      ok: true,
+      batchId,
+      currentVersionId: cur.id,
+      targetVersionId: target.id,
+      reason,
+      changedSegments: plan.changedSegments,
+      changeCount: plan.changeCount,
+      proposalCount: created.length,
+      proposalIds: created.map((p) => p.id),
+      proposals: created,
+    };
+  })();
+}
+
 module.exports = {
   parseTranscript,
   importTranscript,
@@ -1513,6 +1804,8 @@ module.exports = {
   relocateObjection,
   rebasePreview,
   confirmRebase,
+  restorePreview,
+  restoreConfirm,
   respondToObjection,
   publishGate,
   boothView,
