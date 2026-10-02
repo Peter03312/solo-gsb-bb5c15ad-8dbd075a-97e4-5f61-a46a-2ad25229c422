@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "init-db": "node src/db.js",
-    "test": "node test/unit.test.js && node test/e2e.test.js && node test/attachments.test.js && node test/attachments-restart.test.js && node test/follow-notifications.test.js"
+    "test": "node test/unit.test.js && node test/e2e.test.js && node test/attachments.test.js && node test/attachments-restart.test.js && node test/follow-notifications.test.js && node test/restore.test.js"
   },
   "license": "MIT",
   "dependencies": {

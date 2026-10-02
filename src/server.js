@@ -97,6 +97,17 @@ app.post('/api/publish', requireRole('reviewer'), wrap((req, res) => {
   res.status(201).json({ ok: true, versionId });
 }));
 
+// ---------- 历史版本恢复（复核员）：预览逐段净变化；确认采纳只覆盖净变化范围的恢复提议 ----------
+// 恢复预览为只读，不改写任何状态；确认仅空暂存可执行，生成的恢复提议仍经现有异议逐条回应门槛发布。
+app.post('/api/restore-preview', requireRole('reviewer'), wrap((req, res) => {
+  res.json(store.restorePreview(db, req.user, req.body || {}));
+}));
+
+app.post('/api/restore-confirm', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.confirmRestore(db, req.user, req.body || {});
+  res.status(201).json({ ok: true, ...result });
+}));
+
 // ---------- 异议（全部登录用户可提出；重新定位限提出者/复核员，在 store 内校验） ----------
 app.post('/api/objections', requireAuth, wrap((req, res) => {
   const id = store.createObjection(db, req.user, req.body || {});

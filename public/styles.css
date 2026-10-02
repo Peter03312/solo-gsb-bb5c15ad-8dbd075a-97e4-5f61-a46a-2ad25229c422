@@ -376,6 +376,13 @@ body {
 .tag-conflicted { color: var(--danger); border-color: var(--conflict-border); background: var(--conflict-bg); }
 .tag-published { color: #34506a; border-color: var(--publish-border); background: var(--publish-bg); }
 .tag-needs_relocation { color: #9c4c16; border-color: var(--relo-border); background: var(--relo-bg); }
+.tag-restore { color: #4a3a78; border-color: #9b8ec9; background: #efeafb; font-weight: 600; }
+.t-restore { border-left-color: #6b5aa8 !important; background: #f4f1fc; }
+.restore-entry { border-color: #9b8ec9; background: #faf8ff; }
+.restore-reason-box {
+  background: #f4f1fc; border: 1px solid #d8d0f0; border-radius: 4px;
+  padding: 7px 10px; margin: 8px 0; color: #3b2f63;
+}
 .conflict-reason {
   color: var(--danger);
   background: #fbf0ee;

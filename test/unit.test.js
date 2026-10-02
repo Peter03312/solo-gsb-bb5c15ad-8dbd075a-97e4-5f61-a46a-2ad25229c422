@@ -2,7 +2,7 @@
 // 纯文本算子单元测试（码点偏移、合版、引用映射、续提换算）
 const assert = require('assert');
 const crypto = require('crypto');
-const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance, diffLineage } = require('../src/text');
+const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance, diffLineage, editsFromHunks } = require('../src/text');
 const { parseTranscript } = require('../src/store');
 const { sniffMediaType, sha256, MEDIA_TYPES, formatBytes } = require('../src/attachments');
 
@@ -330,5 +330,53 @@ ok(sniffMediaType(Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1]), Buffer.f
 const known = crypto.createHash('sha-256').update('abc').digest('hex');
 ok(sha256(Buffer.from('abc')) === known, 'SHA-256 计算与标准向量一致');
 ok(formatBytes(500) === '500 B' && /KB/.test(formatBytes(2048)) && /MB/.test(formatBytes(5 * 1024 * 1024)), '文件大小可读格式化');
+
+// ---------- 历史版本恢复编辑（editsFromHunks：净变化块 → 反向恢复编辑） ----------
+// v1「甲乙丙丁」→ v2 改乙为 X（提议#8）→ v3 把 X 改回乙（提议#9，相对 v1 原位撤销）并在段尾插「戊」（提议#10）。
+// 恢复目标取 v1（两端 v1↔v3 逐字相同的原位撤销块按净变化口径剔除，只剩净插入「戊」）。
+{
+  const steps = [
+    { version: 2, edits: [{ id: 8, start: 1, end: 2, replace: 'X' }] },
+    { version: 3, edits: [{ id: 9, start: 1, end: 2, replace: '乙' }, { id: 10, start: 4, end: 4, replace: '戊' }] },
+  ];
+  const r = diffLineage('甲乙丙丁', steps, 1, 3);
+  const edits = editsFromHunks(r.hunks);
+  ok(edits.length === 1, `恢复编辑只覆盖净变化范围：相对两端原位撤销处不产生编辑（实际 ${edits.length} 条）`);
+  ok(edits[0].start === 4 && edits[0].end === 5 && edits[0].replace === '',
+    '恢复编辑删掉当前版净插入的“戊”：当前区间 [4,5) → 空串');
+  ok(applyEdits(r.versions[3], edits) === r.versions[1], '应用恢复编辑后逐码点回到目标版 v1');
+}
+
+// 对照到中途版本仍可见真实改动：目标 v2 时 X→乙 是相对两端的真实净变化，恢复会补回乙（历史不可变）
+{
+  const steps = [
+    { version: 2, edits: [{ id: 8, start: 1, end: 2, replace: 'X' }] },
+    { version: 3, edits: [{ id: 9, start: 1, end: 2, replace: '乙' }, { id: 10, start: 4, end: 4, replace: '戊' }] },
+  ];
+  const r = diffLineage('甲乙丙丁', steps, 2, 3);
+  const edits = editsFromHunks(r.hunks);
+  ok(edits.length === 2, `恢复到中途版 v2：X→乙 与插入戊均为净变化（实际 ${edits.length} 条）`);
+  ok(applyEdits(r.versions[3], edits) === r.versions[2], '恢复到 v2 的编辑应用后逐码点等于 v2 快照');
+}
+
+// 重复文字不按同文搜索配对：v1「甲乙丙」→ v2 删乙并在段尾插乙「甲丙乙」；
+// 恢复必须按身份把“删掉的乙”补回原位、把段尾的乙删掉，而非当作无变化
+{
+  const steps = [
+    { version: 2, edits: [
+      { id: 11, start: 1, end: 2, replace: '' },
+      { id: 12, start: 3, end: 3, replace: '乙' },
+    ] },
+  ];
+  const r = diffLineage('甲乙丙', steps, 1, 2);
+  const edits = editsFromHunks(r.hunks);
+  ok(r.hunks.length === 2, `重复乙报为两处独立净变化（删除+插入，实际 ${r.hunks.length} 处），不配成移动`);
+  ok(applyEdits(r.versions[2], edits) === '甲乙丙', '重复文字的恢复编辑仍精确回到目标版原文（不凭同文搜索）');
+  // 当前文「甲丙乙」中身份为甲(0)、丙(1)的未变码点不在任何非零长度恢复编辑内
+  // （恢复编辑：[1,1)->'乙' 零长度插回、[2,3)->'' 删除段尾乙）
+  const touches = (cp) => edits.some((e) => e.start < e.end && e.start <= cp && cp < e.end);
+  ok(!touches(0), '未变化码点甲不被任何非零长度恢复编辑误算为触及');
+  ok(!touches(1), '未变化码点丙不被任何非零长度恢复编辑误算为触及');
+}
 
 console.log(`\n单元测试全部通过：${n} 项 ✅`);

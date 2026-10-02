@@ -319,6 +319,11 @@ function diffLineage(initialText, steps, aVersion, bVersion) {
       kind,
       old: { start: oldStart, end: oldEnd, text: oldText },
       now: { start: newStart, end: newEnd, text: newText },
+      // 对齐间隙在两版坐标中的落点：纯插入时 now 为零长度，pointNow 是插入点在新版的位置
+      // （即所插文字在新版的起点）；纯删除时 old 非零、now 为零长度，pointNow 是删除点在新版的位置。
+      // 恢复（new→old 反向编辑）据此定位：插入的文字要在 pointNow 处删除，删除的文字要在 pointNow 处插回。
+      pointOld: dels[0] ? dels[0].gap : inss[0].gap,
+      pointNow: inss[0] ? inss[0].gap : dels[0].gap,
       contributors,
     });
   }
@@ -329,6 +334,26 @@ function diffLineage(initialText, steps, aVersion, bVersion) {
     if (ver <= bVersion) versions[ver] = ids.map((x) => chOf.get(x)).join('');
   }
   return { versions, hunks };
+}
+
+// ---------- 历史版本恢复 ----------
+// 由“目标版 → 当前版”的净变化块（diffLineage(a=目标, b=当前) 输出）生成把当前正文恢复到
+// 目标正文的修订编辑（坐标与文字均以“当前正文”为准，可直接 applyEdits 到当前文本）：
+//   - 替换块：当前区间 [now.start,now.end) 的文字换成目标文字 old.text；
+//   - 纯插入块（当前版多了文字）：在当前 pointNow 处删除新文字 [pointNow, pointNow+len(now.text))；
+//   - 纯删除块（当前版少了文字）：在当前 pointNow 处插回目标文字（零长度起点）。
+// 未变化范围不产生任何编辑（不被误算为触及）；重复文字的身份对齐已由 diffLineage 完成，
+// 这里只做几何转换，绝不按同文搜索定位。生成的编辑与 applyEdits 口径一致、互不重叠。
+function editsFromHunks(hunks) {
+  return hunks.map((h) => {
+    if (h.kind === 'insert') {
+      return { start: h.now.start, end: h.now.end, replace: '' };
+    }
+    if (h.kind === 'delete') {
+      return { start: h.pointNow, end: h.pointNow, replace: h.old.text };
+    }
+    return { start: h.now.start, end: h.now.end, replace: h.old.text };
+  });
 }
 
 module.exports = {
@@ -342,4 +367,5 @@ module.exports = {
   editTouchesAnchor,
   replayProvenance,
   diffLineage,
+  editsFromHunks,
 };
